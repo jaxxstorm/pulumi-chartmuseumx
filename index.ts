@@ -1,5 +1,5 @@
-import {ComponentResource, ComponentResourceOptions, Input, Output} from "@pulumi/pulumi";
-import {s3} from "@pulumi/aws";
+import * as pulumi from "@pulumi/pulumi";
+import * as aws from "@pulumi/aws";
 import * as kubernetes from "@pulumi/kubernetes"
 
 // define the shape of the args
@@ -10,10 +10,6 @@ export interface ChartMuseumArgs {
     metrics?: boolean;
     service?: {
         type: string
-    }
-    storage: {
-        cloud: string,
-        region: string,
     }
 }
 
@@ -26,28 +22,32 @@ const ChartMuseumDefaults: ChartMuseumArgs = {
     },
     api: false,
     metrics: false,
-    storage: {
-        cloud: "amazon",
-        region: "us-west-2",
-    }
 }
 
-export class ChartMuseum extends ComponentResource {
+const config = new pulumi.Config("chartmuseum")
+const provider = config.require("provider")
+const region = config.require("region")
+
+
+export class ChartMuseum extends pulumi.ComponentResource {
     deployment: kubernetes.apps.v1.Deployment
     namespace: kubernetes.core.v1.Namespace
     service: kubernetes.core.v1.Service
-    bucket: s3.Bucket
+    secret: kubernetes.core.v1.Secret
+    bucket: aws.s3.Bucket
+    cloudProvider: string
+    cloudProviderRegion: string
 
     private readonly name: string
     private args: ChartMuseumArgs;
     private readonly api: string
     private readonly metrics: string
 
-    constructor(name: string, args?: ChartMuseumArgs, opts?: ComponentResourceOptions) {
+    constructor(name: string, args?: ChartMuseumArgs, opts?: pulumi.ComponentResourceOptions) {
         super("jaxxstorm:chartmuseum", name, {}, opts);
 
         this.name = name;
-        this.args = { ...ChartMuseumDefaults, ...args}
+        this.args = {...ChartMuseumDefaults, ...args}
         this.api = String(!this.args.api) // the env var is "DISABLE_API" so we invert
         this.metrics = String(!this.args.metrics)
 
@@ -56,19 +56,69 @@ export class ChartMuseum extends ComponentResource {
             release: name,
         }
 
-        this.bucket = new s3.Bucket(`${name}-bucket`, {}, { parent: this })
-
-        this.namespace = new kubernetes.core.v1.Namespace(`${name}-namespace`, {
+        this.namespace = new kubernetes.core.v1.Namespace(`chartmuseum-${name}-namespace`, {
             metadata: {
                 name: this.args.namespace,
                 labels: labels
             }
-        }, { parent: this})
+        }, {parent: this})
 
-        this.deployment = new kubernetes.apps.v1.Deployment(`${name}-deployment`, {
+        switch (provider) {
+            case "aws":
+                this.bucket = new aws.s3.Bucket(`chartmuseum-${name}-bucket`, {}, {parent: this})
+
+                let iamUser = new aws.iam.User(`chartmuseum-${name}-iam-user`, {
+                    path: "/chartmuseum/"
+                }, {parent: this})
+
+                new aws.iam.UserPolicy(`chartmuseum-${name}-iam-policy`, {
+                    user: iamUser.name,
+                    policy: this.bucket.bucket.apply(bucketName => JSON.stringify({
+                        Version: "2012-10-17",
+                        Statement: [{
+                            Sid: "AllowListObjects",
+                            Effect: "Allow",
+                            Action: ["s3:ListBucket"],
+                            Resource: `arn:aws:s3:::${bucketName}`,
+                        }, {
+                            Sid: "AllowObjectsCRUD",
+                            Effect: "Allow",
+                            Action: [
+                                "s3:DeleteObject",
+                                "s3:GetObject",
+                                "s3:PutObject"
+                            ],
+                            Resource: `arn:aws:s3:::${bucketName}/*`
+                        }],
+                    })),
+                }, {parent: iamUser})
+                const accessKey = new aws.iam.AccessKey(`chartmuseum-${name}-iam-accesskey`, {
+                    user: iamUser.name
+                }, {parent: iamUser})
+
+                // register the secret with k8s and input the credentials
+                this.secret = new kubernetes.core.v1.Secret(`chartmuseum-${name}-secret`, {
+                    metadata: {
+                        namespace: this.namespace.metadata.name,
+                        labels: labels,
+                    },
+                    data: {
+                        "AWS_ACCESS_KEY_ID": accessKey.id.apply(k => Buffer.from(k).toString("base64")),
+                        "AWS_SECRET_ACCESS_KEY": accessKey.secret.apply(k => Buffer.from(k).toString("base64")),
+                    }
+                }, {parent: this.namespace})
+
+                this.cloudProvider = "amazon"
+                this.cloudProviderRegion = region
+                break;
+            default:
+                throw new pulumi.RunError("Must specify a cloud provider")
+                break;
+        }
+
+        this.deployment = new kubernetes.apps.v1.Deployment(`chartmuseum-${name}-deployment`, {
             metadata: {
                 namespace: this.namespace.metadata.name,
-                name: name,
                 labels: labels
             },
             spec: {
@@ -114,15 +164,33 @@ export class ChartMuseum extends ComponentResource {
                                 },
                                 {
                                     name: "STORAGE",
-                                    value: this.args.storage.cloud
+                                    value: this.cloudProvider
                                 },
                                 {
-                                    name: `STORAGE_${this.args.storage.region.toUpperCase()}_REGION`,
-                                    value: this.args.storage.region
+                                    name: `STORAGE_${this.cloudProvider.toUpperCase()}_REGION`,
+                                    value: this.cloudProviderRegion
                                 },
                                 {
-                                    name: `STORAGE_${this.args.storage.cloud.toUpperCase()}_BUCKET`,
+                                    name: `STORAGE_${this.cloudProvider.toUpperCase()}_BUCKET`,
                                     value: this.bucket.bucket,
+                                },
+                                {
+                                    name: "AWS_ACCESS_KEY_ID",
+                                    valueFrom: {
+                                        secretKeyRef: {
+                                            name: this.secret.metadata.name,
+                                            key: "AWS_ACCESS_KEY_ID"
+                                        }
+                                    }
+                                },
+                                {
+                                    name: "AWS_SECRET_ACCESS_KEY",
+                                    valueFrom: {
+                                        secretKeyRef: {
+                                            name: this.secret.metadata.name,
+                                            key: "AWS_SECRET_ACCESS_KEY"
+                                        }
+                                    }
                                 }
                             ],
                             args: [
@@ -154,10 +222,6 @@ export class ChartMuseum extends ComponentResource {
                                 successThreshold: 1,
                                 timeoutSeconds: 1,
                             },
-                            volumeMounts: [{
-                                mountPath: "/storage",
-                                name: "storage-volume",
-                            }],
                         }],
                         volumes: [{
                             name: "storage-volume",
@@ -168,15 +232,15 @@ export class ChartMuseum extends ComponentResource {
             },
         }, {parent: this.namespace, dependsOn: this.bucket});
 
-        this.service = new kubernetes.core.v1.Service(`${name}-service`, {
+        this.service = new kubernetes.core.v1.Service(`chartmuseum-${name}-service`, {
             metadata: {
-                name: this.name,
                 labels: labels,
+                namespace: this.namespace.metadata.name,
             },
             spec: {
                 type: this.args.service?.type,
                 ports: [{
-                    port: 8080,
+                    port: 80,
                     targetPort: "http",
                     protocol: "TCP",
                     name: "http",
